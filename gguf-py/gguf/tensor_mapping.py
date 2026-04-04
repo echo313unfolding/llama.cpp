@@ -857,6 +857,10 @@ class TensorNameMap:
             "model.layers.layers.{bid}.mixer.out_proj",  # plamo2
         ),
 
+        MODEL_TENSOR.SSM_MIX: (
+            "model.layers.{bid}.linear",  # zamba2
+        ),
+
         MODEL_TENSOR.SSM_ALPHA: (
             "model.layers.{bid}.linear_attn.in_proj_a",  # qwen3.5
         ),

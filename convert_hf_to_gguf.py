@@ -8465,6 +8465,154 @@ class JambaModel(TextModel):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
+@ModelBase.register("Zamba2ForCausalLM")
+class Zamba2Model(Mamba2Model):
+    """Hybrid Mamba-2 + shared Transformer model (Zyphra).
+
+    Pure mamba layers: input_layernorm + mamba.{A_log, D, conv1d, dt_bias, in_proj, norm, out_proj}
+    Hybrid layers: mamba_decoder.* (same as pure mamba) + linear.weight (SSM mix) +
+        shared_transformer.* (attention + FFN, stored only under the first num_mem_blocks
+        hybrid layer indices, duplicated to all hybrid layers at conversion time).
+    """
+    model_arch = gguf.MODEL_ARCH.ZAMBA2
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Fix d_inner: parent reads intermediate_size (FFN dim), but Zamba2's SSM
+        # d_inner is mamba_expand * hidden_size
+        mamba_expand = self.hparams.get("mamba_expand", 2)
+        self.d_inner = int(mamba_expand * self.d_model)
+        self.n_group = self.hparams.get("mamba_ngroups", 1)
+
+        # Layer classification from config
+        block_types = self.hparams.get("layers_block_type", [])
+        self._hybrid_layers: list[int] = [
+            i for i, t in enumerate(block_types) if t == "hybrid"
+        ]
+        self._num_mem_blocks: int = self.hparams.get("num_mem_blocks", 1)
+
+        # Map shared block index -> list of hybrid layer indices that use it.
+        # Hybrid visit N uses shared block (N % num_mem_blocks).
+        self._shared_block_layers: dict[int, list[int]] = {}
+        for visit_idx, layer_idx in enumerate(self._hybrid_layers):
+            block_idx = visit_idx % self._num_mem_blocks
+            self._shared_block_layers.setdefault(block_idx, []).append(layer_idx)
+
+        # Source layers: first num_mem_blocks hybrid layers store the shared weights
+        self._shared_block_src: list[int] = self._hybrid_layers[:self._num_mem_blocks]
+
+    def set_vocab(self):
+        # Zamba2 uses LlamaTokenizer (sentencepiece); tokenizer.json may be the
+        # only file present (no tokenizer.model).  Follow JambaModel's pattern.
+        if (self.dir_model / "tokenizer.model").is_file():
+            self._set_vocab_sentencepiece()
+        elif (self.dir_model / "tokenizer.json").is_file():
+            self._set_vocab_llama_hf()
+        else:
+            self._set_vocab_builtin("gpt-neox", self.hparams["vocab_size"])
+
+    def set_gguf_parameters(self):
+        hparams = self.hparams
+        n_head = hparams["num_attention_heads"]
+        n_kv   = hparams.get("num_key_value_heads", n_head)
+        block_types = hparams.get("layers_block_type", [])
+
+        # Per-layer KV head count: 0 for mamba-only, n_kv for hybrid
+        n_kv_vec = [n_kv if t == "hybrid" else 0 for t in block_types]
+
+        head_dim = hparams.get("attention_head_dim",
+                               hparams.get("attention_hidden_size", 2 * self.d_model) // n_head)
+
+        self.gguf_writer.add_block_count(self.block_count)
+        self.gguf_writer.add_embedding_length(self.d_model)
+        self.gguf_writer.add_head_count(n_head)
+        self.gguf_writer.add_head_count_kv(n_kv_vec)
+        self.gguf_writer.add_key_length(head_dim)
+        self.gguf_writer.add_value_length(head_dim)
+        self.gguf_writer.add_feed_forward_length(
+            hparams.get("ffn_hidden_size", hparams.get("intermediate_size")))
+        self.gguf_writer.add_layer_norm_rms_eps(hparams.get("rms_norm_eps", 1e-5))
+        self.gguf_writer.add_context_length(hparams.get("max_position_embeddings", 4096))
+        self.gguf_writer.add_vocab_size(hparams["vocab_size"])
+
+        # RoPE (only when use_mem_rope is enabled)
+        if hparams.get("use_mem_rope", False):
+            self.gguf_writer.add_rope_dimension_count(head_dim)
+            self.gguf_writer.add_rope_freq_base(hparams.get("rope_theta", 10000.0))
+        else:
+            self.gguf_writer.add_rope_dimension_count(0)
+
+        # Mamba-2 SSM parameters
+        d_conv  = hparams.get("mamba_d_conv", 4)
+        d_state = hparams.get("mamba_d_state", 64)
+        headdim = hparams.get("mamba_headdim", 64)
+        n_heads = self.d_inner // headdim
+
+        self.gguf_writer.add_ssm_conv_kernel(d_conv)
+        self.gguf_writer.add_ssm_inner_size(self.d_inner)
+        self.gguf_writer.add_ssm_state_size(d_state)
+        self.gguf_writer.add_ssm_time_step_rank(n_heads)
+        self.gguf_writer.add_ssm_group_count(self.n_group)
+
+        self.gguf_writer.add_file_type(self.ftype)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Skip adapter weights (LoRA adapters on gate_up_proj etc.)
+        if "adapter" in name.lower():
+            return
+
+        # Shared transformer tensors: duplicate to all hybrid layers using this block
+        if "shared_transformer" in name:
+            if bid is None or bid not in self._shared_block_src:
+                return
+            block_idx = self._shared_block_src.index(bid)
+            target_layers = self._shared_block_layers[block_idx]
+
+            st = "shared_transformer."
+            tail = name[name.index(st) + len(st):]
+
+            # gate_up_proj: split into ffn_gate + ffn_up
+            if tail == "feed_forward.gate_up_proj.weight":
+                gate, up = data_torch.chunk(2, dim=0)
+                for target_bid in target_layers:
+                    yield (self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE, target_bid), gate)
+                    yield (self.format_tensor_name(gguf.MODEL_TENSOR.FFN_UP, target_bid), up)
+                return
+
+            tensor_map = {
+                "input_layernorm.weight":        gguf.MODEL_TENSOR.ATTN_POST_NORM,
+                "pre_ff_layernorm.weight":       gguf.MODEL_TENSOR.FFN_NORM,
+                "self_attn.q_proj.weight":       gguf.MODEL_TENSOR.ATTN_Q,
+                "self_attn.k_proj.weight":       gguf.MODEL_TENSOR.ATTN_K,
+                "self_attn.v_proj.weight":       gguf.MODEL_TENSOR.ATTN_V,
+                "self_attn.o_proj.weight":       gguf.MODEL_TENSOR.ATTN_OUT,
+                "feed_forward.down_proj.weight": gguf.MODEL_TENSOR.FFN_DOWN,
+            }
+
+            tensor_type = tensor_map.get(tail)
+            if tensor_type is None:
+                return
+
+            for target_bid in target_layers:
+                yield (self.format_tensor_name(tensor_type, target_bid), data_torch)
+            return
+
+        # Linear mixing weight (hybrid layers)
+        if name.endswith(".linear.weight"):
+            if bid is not None:
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.SSM_MIX, bid), data_torch)
+            return
+
+        # Mamba/SSM tensors: strip mamba_decoder prefix then delegate to parent
+        # Parent handles: dt_bias rename, map_tensor_name, conv1d squeeze,
+        #   A_log -> -exp, A/D reshape, NORM reshape
+        if ".mamba_decoder." in name:
+            name = name.replace(".mamba_decoder.", ".")
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("CohereForCausalLM")
 class CommandR2Model(TextModel):
     model_arch = gguf.MODEL_ARCH.COMMAND_R

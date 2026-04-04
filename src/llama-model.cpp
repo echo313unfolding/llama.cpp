@@ -2568,6 +2568,25 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                         type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_ZAMBA2:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
+                ml.get_key(LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
+                ml.get_key(LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
+                ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
+                ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
+
+                // All layers have Mamba-2 (recurrent state needed for all)
+                std::fill(hparams.recurrent_layer_arr.begin(), hparams.recurrent_layer_arr.end(), true);
+
+                switch (hparams.n_layer) {
+                    case 38: type = LLM_TYPE_1B; break;
+                    case 54: type = LLM_TYPE_3B; break;
+                    case 76: type = LLM_TYPE_7B; break;
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_HUNYUAN_MOE:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -2947,6 +2966,18 @@ void llama_model::load_hparams(llama_model_loader & ml) {
     }
 
     hparams.rope_type = llama_model_rope_type(this);
+
+    // PolarQuant KV cache rotation (optional, architecture-independent)
+    ml.get_key(LLM_KV_POLARQUANT_ENABLED,   hparams.pq_enabled,   false);
+    ml.get_key(LLM_KV_POLARQUANT_BASE_SEED, hparams.pq_base_seed, false);
+
+    // Environment variable override for testing (LLAMA_PQ_SEED=42)
+    const char * pq_env = getenv("LLAMA_PQ_SEED");
+    if (pq_env && !hparams.pq_enabled) {
+        hparams.pq_enabled = true;
+        hparams.pq_base_seed = (uint32_t)atoi(pq_env);
+        LLAMA_LOG_INFO("%s: PolarQuant enabled via env (seed=%u)\n", __func__, hparams.pq_base_seed);
+    }
 }
 
 void llama_model::load_vocab(llama_model_loader & ml) {
@@ -6898,6 +6929,66 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_up_b   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias", i), {ffn_intermediate_size}, TENSOR_NOT_REQUIRED);
                     }
                 } break;
+            case LLM_ARCH_ZAMBA2:
+                {
+                    const int64_t d_conv  = hparams.ssm_d_conv;
+                    const int64_t d_inner = hparams.ssm_d_inner;
+                    const int64_t d_state = hparams.ssm_d_state;
+                    const int64_t n_head_ssm = hparams.ssm_dt_rank;
+                    const int64_t n_group = hparams.ssm_n_group;
+                    const int64_t d_conv_dim = d_inner + 2*n_group*d_state;
+                    const int64_t d_proj = d_inner + d_conv_dim + n_head_ssm;
+
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                    if (output == NULL) {
+                        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+                    }
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        const int64_t n_head_kv_i = hparams.n_head_kv(i);
+                        auto & layer = layers[i];
+
+                        // Pre-mamba norm (all layers)
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+
+                        // SSM tensors (all layers have Mamba-2)
+                        layer.ssm_in = create_tensor(tn(LLM_TENSOR_SSM_IN, "weight", i), {n_embd, d_proj}, 0);
+                        layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", i), {d_conv, d_conv_dim}, 0);
+                        layer.ssm_conv1d_b = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "bias", i), {d_conv_dim}, 0);
+                        layer.ssm_dt_b = create_tensor(tn(LLM_TENSOR_SSM_DT, "bias", i), {n_head_ssm}, 0);
+                        layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A, i), {1, n_head_ssm}, 0);
+                        layer.ssm_d = create_tensor(tn(LLM_TENSOR_SSM_D, i), {1, n_head_ssm}, 0);
+                        layer.ssm_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), {d_inner/n_group, n_group}, TENSOR_NOT_REQUIRED);
+                        layer.ssm_out = create_tensor(tn(LLM_TENSOR_SSM_OUT, "weight", i), {d_inner, n_embd}, 0);
+
+                        if (n_head_kv_i > 0) {
+                            // Hybrid layer: attention + FFN + linear mixing
+                            const int64_t attn_hidden = 2 * n_embd;
+
+                            // Pre-attention norm (4096-dim, operates on concat)
+                            layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {attn_hidden}, 0);
+
+                            // Attention weights (input is 4096-dim concat)
+                            // Q/K/V input is 4096 (concat of hidden+original), output is n_heads*head_dim
+                            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {attn_hidden, attn_hidden}, 0);
+                            layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", i), {attn_hidden, attn_hidden}, 0);
+                            layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", i), {attn_hidden, attn_hidden}, 0);
+                            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {attn_hidden, n_embd}, 0);
+
+                            // FFN
+                            layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+                            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
+                            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
+                            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
+
+                            // Linear mixing (transformer output -> mamba input adjustment)
+                            layer.ssm_mix = create_tensor(tn(LLM_TENSOR_SSM_MIX, "weight", i), {n_embd, n_embd}, 0);
+                        }
+                    }
+                } break;
             case LLM_ARCH_HUNYUAN_MOE:
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
@@ -8031,6 +8122,22 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // Initialize PolarQuant KV cache rotation if enabled in GGUF metadata
+    if (hparams.pq_enabled && hparams.pq_base_seed > 0) {
+        uint32_t head_dim = hparams.n_embd_head_k();
+        // Allocate for all layers (indexed by full layer id).
+        // Non-KV layers (e.g. Mamba) waste a small amount of memory but
+        // the rotation is never called for them, and this keeps the
+        // layer_seed = seed + il mapping consistent.
+        uint32_t n_kv_layers = hparams.n_layer;
+        if (!polarquant.init(n_kv_layers, head_dim, hparams.pq_base_seed)) {
+            LLAMA_LOG_ERROR("%s: failed to initialize PolarQuant rotation matrices\n", __func__);
+            return false;
+        }
+        LLAMA_LOG_INFO("%s: PolarQuant KV cache rotation enabled (seed=%u, head_dim=%u, layers=%u)\n",
+                       __func__, hparams.pq_base_seed, head_dim, n_kv_layers);
+    }
+
     return true;
 }
 
@@ -8433,6 +8540,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
                     if (arch == LLM_ARCH_FALCON_H1) {
                         filter_attn = [&](int32_t) { return true; };
+                        filter_recr = [&](int32_t) { return true; };
+                    } else if (arch == LLM_ARCH_ZAMBA2) {
+                        // Zamba2: attention only on hybrid layers, recurrent state on ALL layers
+                        filter_attn = [&](int32_t il) { return hparams.n_head_kv(il) > 0; };
                         filter_recr = [&](int32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
                         filter_attn = [&](int32_t il) {
@@ -8970,6 +9081,9 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_falcon_h1>(*this, params);
             } break;
+            case LLM_ARCH_ZAMBA2:
+                llm = std::make_unique<llm_build_zamba2>(*this, params);
+                break;
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
             {
@@ -9286,6 +9400,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_AFMOE:
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_MIMO2:
+        case LLM_ARCH_ZAMBA2:
         case LLM_ARCH_STEP35:
             return LLAMA_ROPE_TYPE_NEOX;
 

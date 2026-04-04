@@ -152,6 +152,10 @@ struct llama_hparams {
 
     bool ssm_dt_b_c_rms = false;
 
+    // PolarQuant KV cache rotation
+    bool     pq_enabled   = false;
+    uint32_t pq_base_seed = 0;
+
     float f_clamp_kqv      = 0.0f;
     float f_max_alibi_bias = 0.0f;
     float f_logit_scale    = 0.0f;

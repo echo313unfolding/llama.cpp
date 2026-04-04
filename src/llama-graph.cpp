@@ -946,6 +946,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    polarquant       (params.polarquant),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2204,13 +2205,21 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
+    // PolarQuant: rotate K and V before writing to cache
+    ggml_tensor * k_store = k_cur;
+    ggml_tensor * v_store = v_cur;
+    if (polarquant && polarquant->enabled) {
+        k_store = polarquant->rotate(ctx0, k_cur, il);
+        v_store = polarquant->rotate(ctx0, v_cur, il);
+    }
+
     // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_store, k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_store, v_idxs, il));
     }
 
     const auto & kq_mask = inp->get_kq_mask();
@@ -2218,6 +2227,12 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    // PolarQuant: unrotate K and V after reading from cache
+    if (polarquant && polarquant->enabled) {
+        k = polarquant->unrotate(ctx0, k, il);
+        v = polarquant->unrotate(ctx0, v, il);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -2297,11 +2312,17 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
+    // PolarQuant: rotate K before writing to cache
+    ggml_tensor * k_store = k_cur;
+    if (polarquant && polarquant->enabled) {
+        k_store = polarquant->rotate(ctx0, k_cur, il);
+    }
+
     // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_store, k_idxs, il));
     }
 
     const auto & kq_mask = inp->get_kq_mask();
@@ -2309,6 +2330,12 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+
+    // PolarQuant: unrotate K and V after reading from cache
+    if (polarquant && polarquant->enabled) {
+        k = polarquant->unrotate(ctx0, k, il);
+        v = polarquant->unrotate(ctx0, v, il);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -2379,17 +2406,29 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
-    // optionally store to KV cache
-    if (k_cur) {
-        const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
-
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+    // PolarQuant: rotate K and V before writing to cache
+    ggml_tensor * k_store = k_cur;
+    ggml_tensor * v_store = v_cur;
+    if (polarquant && polarquant->enabled) {
+        if (k_store) {
+            k_store = polarquant->rotate(ctx0, k_cur, il);
+        }
+        if (v_store) {
+            v_store = polarquant->rotate(ctx0, v_cur, il);
+        }
     }
 
-    if (v_cur) {
+    // optionally store to KV cache
+    if (k_store) {
+        const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
+
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_store, k_idxs, il));
+    }
+
+    if (v_store) {
         const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_store, v_idxs, il));
     }
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
@@ -2397,6 +2436,12 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    // PolarQuant: unrotate K and V after reading from cache
+    if (polarquant && polarquant->enabled) {
+        k = polarquant->unrotate(ctx0, k, il);
+        v = polarquant->unrotate(ctx0, v, il);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
