@@ -22,6 +22,8 @@ add_library(llama
             llama-io.cpp
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
+            llama-polarquant.cpp
+            polarquant.c
             llama-memory.cpp
             llama-memory-hybrid.cpp
             llama-memory-hybrid-iswa.cpp
@@ -67,6 +69,7 @@ add_library(llama
             models/exaone.cpp
             models/exaone4.cpp
             models/falcon-h1.cpp
+            models/zamba2.cpp
             models/falcon.cpp
             models/gemma-embedding.cpp
             models/gemma.cpp

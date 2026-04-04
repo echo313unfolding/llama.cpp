@@ -347,8 +347,11 @@ llama_context::llama_context(
         sched_reserve();
 
         if (!cparams.flash_attn) {
-            if (ggml_is_quantized(params.type_v)) {
+            if (ggml_is_quantized(params.type_v) && !hparams.pq_enabled) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
+            }
+            if (ggml_is_quantized(params.type_v) && hparams.pq_enabled) {
+                LLAMA_LOG_INFO("%s: PolarQuant enabled — bypassing Flash Attention requirement for quantized V cache\n", __func__);
             }
         }
     }
@@ -2158,6 +2161,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.polarquant  =*/ &model.polarquant,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
