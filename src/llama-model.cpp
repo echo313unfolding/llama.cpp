@@ -2966,18 +2966,6 @@ void llama_model::load_hparams(llama_model_loader & ml) {
     }
 
     hparams.rope_type = llama_model_rope_type(this);
-
-    // PolarQuant KV cache rotation (optional, architecture-independent)
-    ml.get_key(LLM_KV_POLARQUANT_ENABLED,   hparams.pq_enabled,   false);
-    ml.get_key(LLM_KV_POLARQUANT_BASE_SEED, hparams.pq_base_seed, false);
-
-    // Environment variable override for testing (LLAMA_PQ_SEED=42)
-    const char * pq_env = getenv("LLAMA_PQ_SEED");
-    if (pq_env && !hparams.pq_enabled) {
-        hparams.pq_enabled = true;
-        hparams.pq_base_seed = (uint32_t)atoi(pq_env);
-        LLAMA_LOG_INFO("%s: PolarQuant enabled via env (seed=%u)\n", __func__, hparams.pq_base_seed);
-    }
 }
 
 void llama_model::load_vocab(llama_model_loader & ml) {
@@ -6978,10 +6966,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", i), {attn_hidden, attn_hidden}, 0);
                             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {attn_hidden, n_embd}, 0);
 
-                            // FFN
+                            // FFN (fused gate+up)
                             layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
-                            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
-                            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
+                            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff * 2}, 0);
                             layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
 
                             // Linear mixing (transformer output -> mamba input adjustment)
@@ -8120,22 +8107,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
-    }
-
-    // Initialize PolarQuant KV cache rotation if enabled in GGUF metadata
-    if (hparams.pq_enabled && hparams.pq_base_seed > 0) {
-        uint32_t head_dim = hparams.n_embd_head_k();
-        // Allocate for all layers (indexed by full layer id).
-        // Non-KV layers (e.g. Mamba) waste a small amount of memory but
-        // the rotation is never called for them, and this keeps the
-        // layer_seed = seed + il mapping consistent.
-        uint32_t n_kv_layers = hparams.n_layer;
-        if (!polarquant.init(n_kv_layers, head_dim, hparams.pq_base_seed)) {
-            LLAMA_LOG_ERROR("%s: failed to initialize PolarQuant rotation matrices\n", __func__);
-            return false;
-        }
-        LLAMA_LOG_INFO("%s: PolarQuant KV cache rotation enabled (seed=%u, head_dim=%u, layers=%u)\n",
-                       __func__, hparams.pq_base_seed, head_dim, n_kv_layers);
     }
 
     return true;

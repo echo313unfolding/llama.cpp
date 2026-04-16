@@ -8277,7 +8277,7 @@ class Mamba2Model(TextModel):
         super().__init__(dir_model, *args, hparams=hparams, **kwargs)
         self.d_model = self.find_hparam(["hidden_size", "d_model", "dim"])
         self.d_inner = self.find_hparam(["mamba_d_ssm", "intermediate_size", "d_inner"], optional=True) or 2 * self.d_model
-        self.n_group = self.find_hparam(["n_groups"], optional=True) or 1
+        self.n_group = self.find_hparam(["n_groups", "mamba_ngroups"], optional=True) or 1
 
     def set_vocab(self):
         vocab_size = self.hparams["vocab_size"]
@@ -8467,23 +8467,14 @@ class JambaModel(TextModel):
 
 @ModelBase.register("Zamba2ForCausalLM")
 class Zamba2Model(Mamba2Model):
-    """Hybrid Mamba-2 + shared Transformer model (Zyphra).
-
-    Pure mamba layers: input_layernorm + mamba.{A_log, D, conv1d, dt_bias, in_proj, norm, out_proj}
-    Hybrid layers: mamba_decoder.* (same as pure mamba) + linear.weight (SSM mix) +
-        shared_transformer.* (attention + FFN, stored only under the first num_mem_blocks
-        hybrid layer indices, duplicated to all hybrid layers at conversion time).
-    """
     model_arch = gguf.MODEL_ARCH.ZAMBA2
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # Fix d_inner: parent reads intermediate_size (FFN dim), but Zamba2's SSM
-        # d_inner is mamba_expand * hidden_size
-        mamba_expand = self.hparams.get("mamba_expand", 2)
+        # Zamba2's SSM d_inner is mamba_expand * hidden_size (intermediate_size is the FFN dim)
+        mamba_expand = self.find_hparam(["mamba_expand"], optional=True) or 2
         self.d_inner = int(mamba_expand * self.d_model)
-        self.n_group = self.hparams.get("mamba_ngroups", 1)
 
         # Layer classification from config
         block_types = self.hparams.get("layers_block_type", [])
@@ -8569,33 +8560,33 @@ class Zamba2Model(Mamba2Model):
             block_idx = self._shared_block_src.index(bid)
             target_layers = self._shared_block_layers[block_idx]
 
-            st = "shared_transformer."
-            tail = name[name.index(st) + len(st):]
+            # Strip the shared_transformer prefix so names match the standard HF layout
+            tail = name.partition("shared_transformer.")[2]
 
-            # gate_up_proj: split into ffn_gate + ffn_up
-            if tail == "feed_forward.gate_up_proj.weight":
-                gate, up = data_torch.chunk(2, dim=0)
+            # input_layernorm sits before the attention-on-concat block, so it maps
+            # to ATTN_POST_NORM rather than the default ATTN_NORM.  Handle explicitly.
+            if tail == "input_layernorm.weight":
                 for target_bid in target_layers:
-                    yield (self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE, target_bid), gate)
-                    yield (self.format_tensor_name(gguf.MODEL_TENSOR.FFN_UP, target_bid), up)
+                    yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_POST_NORM, target_bid), data_torch)
                 return
 
-            tensor_map = {
-                "input_layernorm.weight":        gguf.MODEL_TENSOR.ATTN_POST_NORM,
-                "pre_ff_layernorm.weight":       gguf.MODEL_TENSOR.FFN_NORM,
-                "self_attn.q_proj.weight":       gguf.MODEL_TENSOR.ATTN_Q,
-                "self_attn.k_proj.weight":       gguf.MODEL_TENSOR.ATTN_K,
-                "self_attn.v_proj.weight":       gguf.MODEL_TENSOR.ATTN_V,
-                "self_attn.o_proj.weight":       gguf.MODEL_TENSOR.ATTN_OUT,
-                "feed_forward.down_proj.weight": gguf.MODEL_TENSOR.FFN_DOWN,
+            # Skip anything we don't intend to convert (e.g. adapter residue).
+            known_tails = {
+                "pre_ff_layernorm.weight",
+                "self_attn.q_proj.weight",
+                "self_attn.k_proj.weight",
+                "self_attn.v_proj.weight",
+                "self_attn.o_proj.weight",
+                "feed_forward.gate_up_proj.weight",
+                "feed_forward.down_proj.weight",
             }
-
-            tensor_type = tensor_map.get(tail)
-            if tensor_type is None:
+            if tail not in known_tails:
                 return
 
+            # Delegate to the parent's tensor-name mapping, once per target layer.
             for target_bid in target_layers:
-                yield (self.format_tensor_name(tensor_type, target_bid), data_torch)
+                rewritten = f"model.layers.{target_bid}.{tail}"
+                yield from super().modify_tensors(data_torch, rewritten, target_bid)
             return
 
         # Linear mixing weight (hybrid layers)

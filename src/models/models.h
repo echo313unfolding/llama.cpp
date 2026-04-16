@@ -235,10 +235,6 @@ struct llm_build_falcon_h1 : public llm_build_mamba_base {
     llm_build_falcon_h1(const llama_model & model, const llm_graph_params & params);
 };
 
-struct llm_build_zamba2 : public llm_build_mamba_base {
-    llm_build_zamba2(const llama_model & model, const llm_graph_params & params);
-};
-
 struct llm_build_gemma2_iswa : public llm_graph_context {
     llm_build_gemma2_iswa(const llama_model & model, const llm_graph_params & params);
 };
@@ -721,4 +717,8 @@ struct llm_build_wavtokenizer_dec : public llm_graph_context {
 
 struct llm_build_xverse : public llm_graph_context {
     llm_build_xverse(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llm_build_zamba2 : public llm_build_mamba_base {
+    llm_build_zamba2(const llama_model & model, const llm_graph_params & params);
 };

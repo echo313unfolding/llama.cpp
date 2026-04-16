@@ -5,7 +5,6 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
-#include "llama-polarquant.h"
 #include "llama-vocab.h"
 
 #include <map>
@@ -553,8 +552,6 @@ struct llama_model {
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
     std::vector<llama_layer> layers;
-
-    llama_polarquant polarquant;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see

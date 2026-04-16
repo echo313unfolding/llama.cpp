@@ -4,7 +4,6 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
-#include "llama-polarquant.h"
 
 #include <cstdint>
 #include <vector>
@@ -545,7 +544,6 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    const llama_polarquant       * polarquant;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -760,7 +758,6 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    const llama_polarquant       * polarquant;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

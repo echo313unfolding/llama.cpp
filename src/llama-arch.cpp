@@ -275,9 +275,6 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
 
     { LLM_KV_WKV_HEAD_SIZE, "%s.wkv.head_size" },
 
-    { LLM_KV_POLARQUANT_ENABLED,   "%s.polarquant.enabled"   },
-    { LLM_KV_POLARQUANT_BASE_SEED, "%s.polarquant.base_seed" },
-
     { LLM_KV_POSNET_EMBEDDING_LENGTH, "%s.posnet.embedding_length" },
     { LLM_KV_POSNET_BLOCK_COUNT,      "%s.posnet.block_count"      },
 

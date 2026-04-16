@@ -82,9 +82,9 @@ llm_build_zamba2::llm_build_zamba2(const llama_model & model, const llm_graph_pa
 
             cur = build_ffn(cur,
                     model.layers[il].ffn_up,   NULL, NULL,
-                    model.layers[il].ffn_gate, NULL, NULL,
+                    NULL,                      NULL, NULL,
                     model.layers[il].ffn_down, NULL, NULL,
-                    NULL, LLM_FFN_GELU, LLM_FFN_PAR, il);
+                    NULL, LLM_FFN_GEGLU, LLM_FFN_SEQ, il);
             cb(cur, "ffn_out", il);
 
             // Step 3: Linear mixing (transformer output projection)
