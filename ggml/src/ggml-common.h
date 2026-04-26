@@ -245,6 +245,29 @@ typedef struct {
 } block_q8_0;
 static_assert(sizeof(block_q8_0) == sizeof(ggml_half) + QK8_0, "wrong q8_0 block size/padding");
 
+// HXQ affine per-group-128: W[i] = qs[i] * scale + offset
+// Calibration-free, universal across transformer/SSM/hybrid/MoE architectures.
+// See: https://github.com/echo313unfolding/hxq-native
+#define QK_HXQ_AFFINE 128
+typedef struct {
+    ggml_half scale;              // per-group scale (f16)
+    ggml_half offset;             // per-group offset (f16)
+    uint8_t   qs[QK_HXQ_AFFINE]; // quantized indices (uint8)
+} block_hxq_affine_g128;
+static_assert(sizeof(block_hxq_affine_g128) == 2*sizeof(ggml_half) + QK_HXQ_AFFINE, "wrong hxq_affine_g128 block size/padding");
+
+// HXQ affine 6-bit per-group-128: W[i] = qs6[i] * scale + offset
+// 6-bit indices (0-63), packed 4 per 3 bytes. 128 indices = 96 bytes.
+// Block: scale(f16) + offset(f16) + 96 bytes = 100 bytes / 128 elements = 6.25 bpw.
+#define QK_HXQ_AFFINE_6 128
+#define HXQ_AFFINE_6_PACKED_SIZE 96  // 128 * 6 / 8
+typedef struct {
+    ggml_half scale;                          // per-group scale (f16)
+    ggml_half offset;                         // per-group offset (f16)
+    uint8_t   qs[HXQ_AFFINE_6_PACKED_SIZE];  // 6-bit packed indices
+} block_hxq_affine_6;
+static_assert(sizeof(block_hxq_affine_6) == 2*sizeof(ggml_half) + HXQ_AFFINE_6_PACKED_SIZE, "wrong hxq_affine_6 block size/padding");
+
 #define QK8_1 32
 typedef struct {
     GGML_EXTENSION union {

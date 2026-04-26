@@ -423,8 +423,8 @@ extern "C" {
         // GGML_TYPE_Q4_0_8_8 = 33,
         GGML_TYPE_TQ1_0   = 34,
         GGML_TYPE_TQ2_0   = 35,
-        // GGML_TYPE_IQ4_NL_4_4 = 36,
-        // GGML_TYPE_IQ4_NL_4_8 = 37,
+        GGML_TYPE_HXQ_AFFINE_G128 = 36, // HXQ affine per-group-128 (uint8 indices + f16 scale/offset)
+        GGML_TYPE_HXQ_AFFINE_6    = 37, // HXQ affine 6-bit per-group-128 (6-bit indices + f16 scale/offset)
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)

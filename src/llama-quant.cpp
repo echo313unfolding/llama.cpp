@@ -829,6 +829,9 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ3_S:
         case LLAMA_FTYPE_MOSTLY_IQ3_M:   return GGML_TYPE_IQ3_S;
 
+        case LLAMA_FTYPE_MOSTLY_HXQ_AFFINE_G128: return GGML_TYPE_HXQ_AFFINE_G128;
+        case LLAMA_FTYPE_MOSTLY_HXQ_AFFINE_6:   return GGML_TYPE_HXQ_AFFINE_6;
+
         default: return GGML_TYPE_COUNT;
     }
 }

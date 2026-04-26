@@ -504,6 +504,127 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+// HXQ affine per-group-128: quantize float32 → uint8 indices + per-group scale/offset
+void quantize_row_hxq_affine_g128_ref(const float * GGML_RESTRICT x, block_hxq_affine_g128 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_HXQ_AFFINE == 0);
+    const int nb = k / QK_HXQ_AFFINE;
+
+    for (int i = 0; i < nb; i++) {
+        float vmin =  FLT_MAX;
+        float vmax = -FLT_MAX;
+
+        for (int j = 0; j < QK_HXQ_AFFINE; j++) {
+            const float v = x[i * QK_HXQ_AFFINE + j];
+            if (v < vmin) vmin = v;
+            if (v > vmax) vmax = v;
+        }
+
+        const float range = vmax - vmin;
+        const float scale = range / 255.0f;
+        const float inv_scale = (scale > 1e-10f) ? 1.0f / scale : 0.0f;
+
+        y[i].scale  = GGML_FP32_TO_FP16(scale);
+        y[i].offset = GGML_FP32_TO_FP16(vmin);
+
+        for (int j = 0; j < QK_HXQ_AFFINE; j++) {
+            float v = (x[i * QK_HXQ_AFFINE + j] - vmin) * inv_scale;
+            v = (v < 0.0f) ? 0.0f : (v > 255.0f) ? 255.0f : v;
+            y[i].qs[j] = (uint8_t)(v + 0.5f);
+        }
+    }
+}
+
+// HXQ affine per-group-128: dequantize uint8 indices → float32
+// W[i] = qs[i] * scale + offset
+void dequantize_row_hxq_affine_g128(const block_hxq_affine_g128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_HXQ_AFFINE;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float scale  = GGML_FP16_TO_FP32(x[i].scale);
+        const float offset = GGML_FP16_TO_FP32(x[i].offset);
+
+        for (int j = 0; j < qk; j++) {
+            y[i * qk + j] = x[i].qs[j] * scale + offset;
+        }
+    }
+}
+
+// HXQ affine 6-bit per-group-128: quantize float32 → 6-bit packed indices + per-group scale/offset
+void quantize_row_hxq_affine_6_ref(const float * GGML_RESTRICT x, block_hxq_affine_6 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_HXQ_AFFINE_6 == 0);
+    const int nb = k / QK_HXQ_AFFINE_6;
+
+    for (int i = 0; i < nb; i++) {
+        float vmin =  FLT_MAX;
+        float vmax = -FLT_MAX;
+
+        for (int j = 0; j < QK_HXQ_AFFINE_6; j++) {
+            const float v = x[i * QK_HXQ_AFFINE_6 + j];
+            if (v < vmin) vmin = v;
+            if (v > vmax) vmax = v;
+        }
+
+        const float range = vmax - vmin;
+        const float scale = range / 63.0f;
+        const float inv_scale = (scale > 1e-10f) ? 1.0f / scale : 0.0f;
+
+        y[i].scale  = GGML_FP32_TO_FP16(scale);
+        y[i].offset = GGML_FP32_TO_FP16(vmin);
+
+        // Quantize to 6-bit indices and pack: 4 indices per 3 bytes
+        // Layout: [aaaaaabb|bbbbcccc|ccdddddd]
+        for (int j = 0; j < QK_HXQ_AFFINE_6; j += 4) {
+            uint8_t idx[4];
+            for (int m = 0; m < 4; m++) {
+                float v = (x[i * QK_HXQ_AFFINE_6 + j + m] - vmin) * inv_scale;
+                v = (v < 0.0f) ? 0.0f : (v > 63.0f) ? 63.0f : v;
+                idx[m] = (uint8_t)(v + 0.5f);
+            }
+            const int byte_idx = (j / 4) * 3;
+            y[i].qs[byte_idx + 0] = (idx[0] & 0x3F) | ((idx[1] & 0x03) << 6);
+            y[i].qs[byte_idx + 1] = ((idx[1] >> 2) & 0x0F) | ((idx[2] & 0x0F) << 4);
+            y[i].qs[byte_idx + 2] = ((idx[2] >> 4) & 0x03) | ((idx[3] & 0x3F) << 2);
+        }
+    }
+}
+
+// HXQ affine 6-bit per-group-128: dequantize 6-bit packed indices → float32
+// W[i] = idx * scale + offset
+void dequantize_row_hxq_affine_6(const block_hxq_affine_6 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_HXQ_AFFINE_6;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float scale  = GGML_FP16_TO_FP32(x[i].scale);
+        const float offset = GGML_FP16_TO_FP32(x[i].offset);
+
+        // Unpack 6-bit indices: 4 per 3 bytes
+        for (int j = 0; j < qk; j += 4) {
+            const int byte_idx = (j / 4) * 3;
+            const uint8_t b0 = x[i].qs[byte_idx + 0];
+            const uint8_t b1 = x[i].qs[byte_idx + 1];
+            const uint8_t b2 = x[i].qs[byte_idx + 2];
+
+            const uint8_t idx0 =  b0       & 0x3F;
+            const uint8_t idx1 = ((b0 >> 6) | (b1 << 2)) & 0x3F;
+            const uint8_t idx2 = ((b1 >> 4) | (b2 << 4)) & 0x3F;
+            const uint8_t idx3 =  b2 >> 2;
+
+            y[i * qk + j + 0] = idx0 * scale + offset;
+            y[i * qk + j + 1] = idx1 * scale + offset;
+            y[i * qk + j + 2] = idx2 * scale + offset;
+            y[i * qk + j + 3] = idx3 * scale + offset;
+        }
+    }
+}
+
 void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_MXFP4;
 
@@ -2220,6 +2341,20 @@ size_t quantize_q8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     (void)quant_weights; // not used
     const size_t row_size = ggml_row_size(GGML_TYPE_Q8_0, n_per_row);
     quantize_row_q8_0_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * row_size;
+}
+
+size_t quantize_hxq_affine_g128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights; // HXQ affine is calibration-free
+    const size_t row_size = ggml_row_size(GGML_TYPE_HXQ_AFFINE_G128, n_per_row);
+    quantize_row_hxq_affine_g128_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * row_size;
+}
+
+size_t quantize_hxq_affine_6(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights; // HXQ affine is calibration-free
+    const size_t row_size = ggml_row_size(GGML_TYPE_HXQ_AFFINE_6, n_per_row);
+    quantize_row_hxq_affine_6_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * row_size;
 }
 
@@ -5474,6 +5609,24 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
             } break;
 
+        case GGML_TYPE_HXQ_AFFINE_G128:
+            {
+                const block_hxq_affine_g128 * q = (const block_hxq_affine_g128 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].scale, i) || !validate_fp16(q[i].offset, i)) {
+                        return false;
+                    }
+                }
+            } break;
+        case GGML_TYPE_HXQ_AFFINE_6:
+            {
+                const block_hxq_affine_6 * q = (const block_hxq_affine_6 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].scale, i) || !validate_fp16(q[i].offset, i)) {
+                        return false;
+                    }
+                }
+            } break;
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:

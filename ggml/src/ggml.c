@@ -904,17 +904,21 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_tq2_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_tq2_0_ref,
     },
-    [36] = { // GGML_TYPE_IQ4_NL_4_4
-        .type_name                = "TYPE_IQ4_NL_4_4 REMOVED, use IQ4_NL with runtime repacking",
-        .blck_size                = 0,
-        .type_size                = 0,
-        .is_quantized             = false,
+    [GGML_TYPE_HXQ_AFFINE_G128] = {
+        .type_name                = "hxq_affine_g128",
+        .blck_size                = QK_HXQ_AFFINE,
+        .type_size                = sizeof(block_hxq_affine_g128),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_hxq_affine_g128,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_hxq_affine_g128_ref,
     },
-    [37] = { // GGML_TYPE_IQ4_NL_4_8
-        .type_name                = "TYPE_IQ4_NL_4_8 REMOVED, use IQ4_NL with runtime repacking",
-        .blck_size                = 0,
-        .type_size                = 0,
-        .is_quantized             = false,
+    [GGML_TYPE_HXQ_AFFINE_6] = {
+        .type_name                = "hxq_affine_6",
+        .blck_size                = QK_HXQ_AFFINE_6,
+        .type_size                = sizeof(block_hxq_affine_6),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_hxq_affine_6,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_hxq_affine_6_ref,
     },
     [38] = { // GGML_TYPE_IQ4_NL_8_8
         .type_name                = "TYPE_IQ4_NL_8_8 REMOVED, use IQ4_NL with runtime repacking",
@@ -7679,6 +7683,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q5_0:    result = quantize_q5_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_1:    result = quantize_q5_1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q8_0:    result = quantize_q8_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_HXQ_AFFINE_G128: result = quantize_hxq_affine_g128(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_MXFP4:   result = quantize_mxfp4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NVFP4:   result = quantize_nvfp4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_K:    result = quantize_q2_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

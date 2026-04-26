@@ -68,6 +68,8 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q8_0",     LLAMA_FTYPE_MOSTLY_Q8_0,     " 7.96G, +0.0026 ppl @ Llama-3-8B",  },
     { "F16",      LLAMA_FTYPE_MOSTLY_F16,      "14.00G, +0.0020 ppl @ Mistral-7B",  },
     { "BF16",     LLAMA_FTYPE_MOSTLY_BF16,     "14.00G, -0.0050 ppl @ Mistral-7B",  },
+    { "HXQ_AFFINE_G128", LLAMA_FTYPE_MOSTLY_HXQ_AFFINE_G128, " 8.25 bpw calibration-free affine", },
+    { "HXQ_AFFINE_6",   LLAMA_FTYPE_MOSTLY_HXQ_AFFINE_6,   " 6.25 bpw calibration-free affine", },
     { "F32",      LLAMA_FTYPE_ALL_F32,         "26.00G              @ 7B",          },
     // Note: Ensure COPY comes after F32 to avoid ftype 0 from matching.
     { "COPY",     LLAMA_FTYPE_ALL_F32,         "only copy tensors, no quantizing",  },

@@ -58,6 +58,117 @@ void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_nvfp4_ref(x, y, k);
 }
 
+void quantize_row_hxq_affine_g128(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_hxq_affine_g128_ref(x, y, k);
+}
+
+void quantize_row_hxq_affine_6(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_hxq_affine_6_ref(x, y, k);
+}
+
+// HXQ affine g128 dot product with Q8_0
+// Each HXQ block has 128 elements = 4 Q8_0 blocks (32 each)
+// dot = sum_j (indices[j] * scale_hxq + offset_hxq) * (q8_val[j] * scale_q8)
+//     = scale_hxq * sum_j(indices[j] * q8_val[j] * scale_q8) + offset_hxq * sum_j(q8_val[j] * scale_q8)
+void ggml_vec_dot_hxq_affine_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_HXQ_AFFINE;  // 128
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_hxq_affine_g128 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float scale_hxq  = GGML_FP16_TO_FP32(x[i].scale);
+        const float offset_hxq = GGML_FP16_TO_FP32(x[i].offset);
+
+        // 4 Q8_0 blocks per HXQ block (128 / 32 = 4)
+        for (int k = 0; k < 4; k++) {
+            const float d_q8 = GGML_FP16_TO_FP32(y[i * 4 + k].d);
+
+            int32_t sumi_idx = 0;  // sum of indices * q8_val
+            int32_t sumi_q8  = 0;  // sum of q8_val (for offset term)
+
+            for (int j = 0; j < QK8_0; j++) {
+                const int q8_val = y[i * 4 + k].qs[j];
+                sumi_idx += (int32_t)x[i].qs[k * QK8_0 + j] * q8_val;
+                sumi_q8  += q8_val;
+            }
+
+            sumf += d_q8 * (scale_hxq * sumi_idx + offset_hxq * sumi_q8);
+        }
+    }
+
+    *s = sumf;
+}
+
+// HXQ affine 6-bit dot product with Q8_0
+// Same structure as g128 but unpacks 6-bit indices from packed bytes
+void ggml_vec_dot_hxq_affine_6_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_HXQ_AFFINE_6;  // 128
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_hxq_affine_6 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float scale_hxq  = GGML_FP16_TO_FP32(x[i].scale);
+        const float offset_hxq = GGML_FP16_TO_FP32(x[i].offset);
+
+        // 4 Q8_0 blocks per HXQ block (128 / 32 = 4)
+        for (int k = 0; k < 4; k++) {
+            const float d_q8 = GGML_FP16_TO_FP32(y[i * 4 + k].d);
+
+            int32_t sumi_idx = 0;
+            int32_t sumi_q8  = 0;
+
+            // Unpack 6-bit indices for this Q8_0 block's 32 elements
+            for (int j = 0; j < QK8_0; j++) {
+                const int elem = k * QK8_0 + j;
+                const int group = elem / 4;
+                const int pos   = elem % 4;
+                const int byte_idx = group * 3;
+                const uint8_t b0 = x[i].qs[byte_idx + 0];
+                const uint8_t b1 = x[i].qs[byte_idx + 1];
+                const uint8_t b2 = x[i].qs[byte_idx + 2];
+
+                uint8_t idx;
+                switch (pos) {
+                    case 0: idx =  b0       & 0x3F; break;
+                    case 1: idx = ((b0 >> 6) | (b1 << 2)) & 0x3F; break;
+                    case 2: idx = ((b1 >> 4) | (b2 << 4)) & 0x3F; break;
+                    default: idx = b2 >> 2; break;
+                }
+
+                const int q8_val = y[i * 4 + k].qs[j];
+                sumi_idx += (int32_t)idx * q8_val;
+                sumi_q8  += q8_val;
+            }
+
+            sumf += d_q8 * (scale_hxq * sumi_idx + offset_hxq * sumi_q8);
+        }
+    }
+
+    *s = sumf;
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
