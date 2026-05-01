@@ -72,7 +72,7 @@ llm_build_zamba2::llm_build_zamba2(const llama_model & model, const llm_graph_pa
 
             // Build attention (O projects from n_heads*head_dim to n_embd)
             cur = build_attn(inp->get_attn(),
-                    model.layers[il].wo, NULL,
+                    model.layers[il].wo, NULL, NULL,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(cur, "attn_out", il);
 
