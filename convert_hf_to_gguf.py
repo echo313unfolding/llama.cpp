@@ -8493,6 +8493,45 @@ class Zamba2Model(Mamba2Model):
         # Source layers: first num_mem_blocks hybrid layers store the shared weights
         self._shared_block_src: list[int] = self._hybrid_layers[:self._num_mem_blocks]
 
+        # Pre-load per-layer adapter weights for merging into shared transformer
+        # weights. Zamba2 has rank-128 LoRA-style adapters that are integral to
+        # the architecture (not optional fine-tuning). Each adapter is a
+        # Sequential(Linear(in, 128), Linear(128, out)), stored as:
+        #   adapter_list.{visit_idx}.0.weight  (down projection)
+        #   adapter_list.{visit_idx}.1.weight  (up projection)
+        # The merged weight = shared_weight + up @ down
+        self._adapter_cache: dict[str, Tensor] = {}
+        self._use_attn_adapters = self.hparams.get("use_shared_attention_adapter", False)
+        self._use_mlp_adapters = self.hparams.get("use_shared_mlp_adapter", True)
+
+        adapter_pattern = re.compile(
+            r"model\.layers\.(\d+)\.shared_transformer\."
+            r"(?:self_attn\.(linear_[qkv]_adapter_list)|feed_forward\.(gate_up_proj_adapter_list))"
+            r"\.(\d+)\.([01])\.weight"
+        )
+        for tname in list(self.model_tensors.keys()):
+            m = adapter_pattern.match(tname)
+            if m:
+                layer_idx = int(m.group(1))
+                adapter_type = m.group(2) or m.group(3)
+                visit_idx = int(m.group(4))
+                seq_idx = int(m.group(5))  # 0=down, 1=up
+                # Only cache from source layers (avoid duplicates from weight ties)
+                if layer_idx in self._shared_block_src:
+                    key = f"{layer_idx}.{adapter_type}.{visit_idx}.{seq_idx}"
+                    self._adapter_cache[key] = self.model_tensors[tname]()
+
+    def _get_adapter_contribution(self, src_layer: int, adapter_type: str, visit_idx: int) -> Tensor | None:
+        """Compute up @ down for a given adapter, returning the additive correction."""
+        down_key = f"{src_layer}.{adapter_type}.{visit_idx}.0"
+        up_key = f"{src_layer}.{adapter_type}.{visit_idx}.1"
+        down = self._adapter_cache.get(down_key)
+        up = self._adapter_cache.get(up_key)
+        if down is None or up is None:
+            return None
+        # Merge in float32 for precision, result will be cast by caller
+        return (up.float() @ down.float())
+
     def set_vocab(self):
         # Zamba2 uses LlamaTokenizer (sentencepiece); tokenizer.json may be the
         # only file present (no tokenizer.model).  Follow JambaModel's pattern.
@@ -8548,12 +8587,21 @@ class Zamba2Model(Mamba2Model):
 
         self.gguf_writer.add_file_type(self.ftype)
 
+    # Map from shared weight tail names to their adapter type names
+    _ADAPTER_MAP: dict[str, str] = {
+        "self_attn.q_proj.weight": "linear_q_adapter_list",
+        "self_attn.k_proj.weight": "linear_k_adapter_list",
+        "self_attn.v_proj.weight": "linear_v_adapter_list",
+        "feed_forward.gate_up_proj.weight": "gate_up_proj_adapter_list",
+    }
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        # Skip adapter weights (LoRA adapters on gate_up_proj etc.)
+        # Skip adapter weights — they are pre-merged into shared weights below
         if "adapter" in name.lower():
             return
 
-        # Shared transformer tensors: duplicate to all hybrid layers using this block
+        # Shared transformer tensors: duplicate to all hybrid layers using this block,
+        # merging per-layer adapter corrections where applicable.
         if "shared_transformer" in name:
             if bid is None or bid not in self._shared_block_src:
                 return
@@ -8583,10 +8631,33 @@ class Zamba2Model(Mamba2Model):
             if tail not in known_tails:
                 return
 
+            # Check if this weight has a corresponding adapter type
+            adapter_type = self._ADAPTER_MAP.get(tail)
+            use_adapter = False
+            if adapter_type:
+                if adapter_type.startswith("linear_") and self._use_attn_adapters:
+                    use_adapter = True
+                elif adapter_type == "gate_up_proj_adapter_list" and self._use_mlp_adapters:
+                    use_adapter = True
+
             # Delegate to the parent's tensor-name mapping, once per target layer.
-            for target_bid in target_layers:
+            for visit_local, target_bid in enumerate(target_layers):
+                # Compute the global visit index for this target layer
+                global_visit = self._hybrid_layers.index(target_bid)
+
+                if use_adapter:
+                    correction = self._get_adapter_contribution(bid, adapter_type, global_visit)
+                    if correction is not None:
+                        # Merge: per-layer weight = shared + adapter_up @ adapter_down
+                        merged = data_torch.float() + correction
+                        layer_data = merged.to(data_torch.dtype)
+                    else:
+                        layer_data = data_torch
+                else:
+                    layer_data = data_torch
+
                 rewritten = f"model.layers.{target_bid}.{tail}"
-                yield from super().modify_tensors(data_torch, rewritten, target_bid)
+                yield from super().modify_tensors(layer_data, rewritten, target_bid)
             return
 
         # Linear mixing weight (hybrid layers)
