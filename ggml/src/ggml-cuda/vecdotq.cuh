@@ -109,6 +109,9 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q1_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
 #define VDR_Q1_0_Q8_1_MMQ  4  // Q1_0 has 128 bits (4 ints) per block
 
+#define VDR_HXQ_AFFINE_G128_Q8_1_MMVQ 1
+#define VDR_HXQ_AFFINE_6_Q8_1_MMVQ    1
+
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
 
@@ -715,6 +718,78 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     // Apply Q1_0's single scale and this chunk's Q8_1 scale
     const float d8 = __low2float(bq8_1_chunk->ds);
     return d1 * d8 * sumi;
+}
+
+// HXQ affine g128: 8-bit indices, scale+offset per group of 128
+// dot(HXQ, Q8_1) = scale * sum(idx[i]*q8[i]) + offset * sum(q8[i])
+// iqs selects which of the 4 chunks of 32 elements to process (0-3)
+static __device__ __forceinline__ float vec_dot_hxq_affine_g128_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_hxq_affine_g128 * bq = (const block_hxq_affine_g128 *) vbq + kbx;
+
+    const float scale  = bq->scale;
+    const float offset = bq->offset;
+
+    const block_q8_1 * bq8 = bq8_1 + iqs;
+
+    // Load 32 uint8 indices for this chunk and pack into 8 ints (4 bytes each)
+    const uint8_t * qs = bq->qs + iqs * 32;
+
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        // Pack 4 unsigned indices into one int
+        const int vi = qs[j*4+0] | (qs[j*4+1] << 8) | (qs[j*4+2] << 16) | (qs[j*4+3] << 24);
+        const int u  = get_int_b4(bq8->qs, j);
+        sumi = ggml_cuda_dp4a(vi, u, sumi);
+    }
+
+    const float d8 = __low2float(bq8->ds);
+    const float s8 = __high2float(bq8->ds);  // sum of q8 values in this block
+
+    return d8 * (scale * sumi + offset * s8);
+}
+
+// HXQ affine 6-bit: 6-bit indices packed 4 per 3 bytes, scale+offset per group of 128
+// dot(HXQ6, Q8_1) = scale * sum(idx6[i]*q8[i]) + offset * sum(q8[i])
+// iqs selects which of the 4 chunks of 32 elements to process (0-3)
+static __device__ __forceinline__ float vec_dot_hxq_affine_6_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_hxq_affine_6 * bq = (const block_hxq_affine_6 *) vbq + kbx;
+
+    const float scale  = bq->scale;
+    const float offset = bq->offset;
+
+    const block_q8_1 * bq8 = bq8_1 + iqs;
+
+    // Each chunk of 32 elements = 8 groups of 4 packed 6-bit values = 24 bytes
+    const uint8_t * qs = bq->qs + iqs * 24;
+    const int8_t  * q8 = bq8->qs;
+
+    int sumi_idx = 0;
+
+    // Unpack 6-bit indices and dot with q8 values
+    // 8 groups of 4 elements, each group is 3 bytes
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        const uint8_t b0 = qs[g * 3 + 0];
+        const uint8_t b1 = qs[g * 3 + 1];
+        const uint8_t b2 = qs[g * 3 + 2];
+
+        const int i0 =  b0       & 0x3F;
+        const int i1 = ((b0 >> 6) | (b1 << 2)) & 0x3F;
+        const int i2 = ((b1 >> 4) | (b2 << 4)) & 0x3F;
+        const int i3 =  b2 >> 2;
+
+        sumi_idx += i0 * q8[g*4+0] + i1 * q8[g*4+1] + i2 * q8[g*4+2] + i3 * q8[g*4+3];
+    }
+
+    const float d8 = __low2float(bq8->ds);
+    const float s8 = __high2float(bq8->ds);
+
+    return d8 * (scale * sumi_idx + offset * s8);
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(

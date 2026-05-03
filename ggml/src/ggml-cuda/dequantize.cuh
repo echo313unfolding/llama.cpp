@@ -97,3 +97,66 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.x *= d;
     v.y *= d;
 }
+
+// HXQ affine g128: 8-bit indices, scale+offset per group of 128
+// W[i] = qs[i] * scale + offset
+static __device__ __forceinline__ void dequantize_hxq_affine_g128(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_hxq_affine_g128 * x = (const block_hxq_affine_g128 *) vx;
+
+    const float scale  = x[ib].scale;
+    const float offset = x[ib].offset;
+
+    v.x = x[ib].qs[iqs + 0] * scale + offset;
+    v.y = x[ib].qs[iqs + 1] * scale + offset;
+}
+
+// HXQ affine 6-bit: 6-bit indices packed 4 per 3 bytes, scale+offset per group of 128
+// W[i] = idx6[i] * scale + offset
+// iqs indexes pairs of elements (0, 2, 4, ... 126)
+static __device__ __forceinline__ void dequantize_hxq_affine_6(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_hxq_affine_6 * x = (const block_hxq_affine_6 *) vx;
+
+    const float scale  = x[ib].scale;
+    const float offset = x[ib].offset;
+
+    // iqs is the element pair index (0..126 stepping by 2)
+    // Each group of 4 elements occupies 3 bytes
+    // Element j is in group (j/4), at position (j%4) within the group
+    const int j0 = iqs;
+    const int j1 = iqs + 1;
+
+    // Unpack element j0
+    const int group0    = j0 / 4;
+    const int pos0      = j0 % 4;
+    const int byte_off0 = group0 * 3;
+    const uint8_t b0_0  = x[ib].qs[byte_off0 + 0];
+    const uint8_t b0_1  = x[ib].qs[byte_off0 + 1];
+    const uint8_t b0_2  = x[ib].qs[byte_off0 + 2];
+
+    int idx0;
+    switch (pos0) {
+        case 0: idx0 =  b0_0       & 0x3F; break;
+        case 1: idx0 = ((b0_0 >> 6) | (b0_1 << 2)) & 0x3F; break;
+        case 2: idx0 = ((b0_1 >> 4) | (b0_2 << 4)) & 0x3F; break;
+        default: idx0 = b0_2 >> 2; break;
+    }
+
+    // Unpack element j1
+    const int group1    = j1 / 4;
+    const int pos1      = j1 % 4;
+    const int byte_off1 = group1 * 3;
+    const uint8_t b1_0  = x[ib].qs[byte_off1 + 0];
+    const uint8_t b1_1  = x[ib].qs[byte_off1 + 1];
+    const uint8_t b1_2  = x[ib].qs[byte_off1 + 2];
+
+    int idx1;
+    switch (pos1) {
+        case 0: idx1 =  b1_0       & 0x3F; break;
+        case 1: idx1 = ((b1_0 >> 6) | (b1_1 << 2)) & 0x3F; break;
+        case 2: idx1 = ((b1_1 >> 4) | (b1_2 << 4)) & 0x3F; break;
+        default: idx1 = b1_2 >> 2; break;
+    }
+
+    v.x = idx0 * scale + offset;
+    v.y = idx1 * scale + offset;
+}

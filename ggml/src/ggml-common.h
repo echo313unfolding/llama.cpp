@@ -249,6 +249,8 @@ static_assert(sizeof(block_q8_0) == sizeof(ggml_half) + QK8_0, "wrong q8_0 block
 // Calibration-free, universal across transformer/SSM/hybrid/MoE architectures.
 // See: https://github.com/echo313unfolding/hxq-native
 #define QK_HXQ_AFFINE 128
+#define QR_HXQ_AFFINE 1
+#define QI_HXQ_AFFINE (QK_HXQ_AFFINE / 32)
 typedef struct {
     ggml_half scale;              // per-group scale (f16)
     ggml_half offset;             // per-group offset (f16)
@@ -260,6 +262,8 @@ static_assert(sizeof(block_hxq_affine_g128) == 2*sizeof(ggml_half) + QK_HXQ_AFFI
 // 6-bit indices (0-63), packed 4 per 3 bytes. 128 indices = 96 bytes.
 // Block: scale(f16) + offset(f16) + 96 bytes = 100 bytes / 128 elements = 6.25 bpw.
 #define QK_HXQ_AFFINE_6 128
+#define QR_HXQ_AFFINE_6 1
+#define QI_HXQ_AFFINE_6 (QK_HXQ_AFFINE_6 / 32)
 #define HXQ_AFFINE_6_PACKED_SIZE 96  // 128 * 6 / 8
 typedef struct {
     ggml_half scale;                          // per-group scale (f16)
