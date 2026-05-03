@@ -8645,7 +8645,7 @@ class Zamba2Model(Mamba2Model):
                 # Compute the global visit index for this target layer
                 global_visit = self._hybrid_layers.index(target_bid)
 
-                if use_adapter:
+                if use_adapter and adapter_type is not None:
                     correction = self._get_adapter_contribution(bid, adapter_type, global_visit)
                     if correction is not None:
                         # Merge: per-layer weight = shared + adapter_up @ adapter_down
