@@ -86,6 +86,11 @@ void ggml_vec_dot_hxq_affine_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs
 
     float sumf = 0.0f;
 
+#if defined(__AVX2__)
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i ones8  = _mm256_set1_epi8(1);
+#endif
+
     for (int i = 0; i < nb; i++) {
         const float scale_hxq  = GGML_FP16_TO_FP32(x[i].scale);
         const float offset_hxq = GGML_FP16_TO_FP32(x[i].offset);
@@ -94,15 +99,45 @@ void ggml_vec_dot_hxq_affine_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs
         for (int k = 0; k < 4; k++) {
             const float d_q8 = GGML_FP16_TO_FP32(y[i * 4 + k].d);
 
-            int32_t sumi_idx = 0;  // sum of indices * q8_val
-            int32_t sumi_q8  = 0;  // sum of q8_val (for offset term)
+#if defined(__AVX2__)
+            // Load 32 uint8 indices and 32 int8 q8 values
+            const __m256i vi = _mm256_loadu_si256((const __m256i *)(x[i].qs + k * QK8_0));
+            const __m256i vq = _mm256_loadu_si256((const __m256i *)y[i * 4 + k].qs);
+
+            // sumi_idx = sum(idx[j] * q8[j]): unsigned × signed → 16-bit pairs → 32-bit
+            const __m256i prod16 = _mm256_maddubs_epi16(vi, vq);
+            const __m256i prod32 = _mm256_madd_epi16(prod16, ones16);
+
+            // sumi_q8 = sum(q8[j])
+            const __m256i qsum16 = _mm256_maddubs_epi16(ones8, vq);
+            const __m256i qsum32 = _mm256_madd_epi16(qsum16, ones16);
+
+            // Horizontal reduce 8 × int32 → scalar
+            const __m128i p_lo = _mm256_castsi256_si128(prod32);
+            const __m128i p_hi = _mm256_extracti128_si256(prod32, 1);
+            const __m128i p_sum = _mm_add_epi32(p_lo, p_hi);
+            const __m128i p_shuf = _mm_shuffle_epi32(p_sum, _MM_SHUFFLE(2, 3, 0, 1));
+            const __m128i p_pair = _mm_add_epi32(p_sum, p_shuf);
+            const int32_t sumi_idx = _mm_cvtsi128_si32(_mm_add_epi32(p_pair,
+                _mm_shuffle_epi32(p_pair, _MM_SHUFFLE(1, 0, 3, 2))));
+
+            const __m128i q_lo = _mm256_castsi256_si128(qsum32);
+            const __m128i q_hi = _mm256_extracti128_si256(qsum32, 1);
+            const __m128i q_sum = _mm_add_epi32(q_lo, q_hi);
+            const __m128i q_shuf = _mm_shuffle_epi32(q_sum, _MM_SHUFFLE(2, 3, 0, 1));
+            const __m128i q_pair = _mm_add_epi32(q_sum, q_shuf);
+            const int32_t sumi_q8 = _mm_cvtsi128_si32(_mm_add_epi32(q_pair,
+                _mm_shuffle_epi32(q_pair, _MM_SHUFFLE(1, 0, 3, 2))));
+#else
+            int32_t sumi_idx = 0;
+            int32_t sumi_q8  = 0;
 
             for (int j = 0; j < QK8_0; j++) {
                 const int q8_val = y[i * 4 + k].qs[j];
                 sumi_idx += (int32_t)x[i].qs[k * QK8_0 + j] * q8_val;
                 sumi_q8  += q8_val;
             }
-
+#endif
             sumf += d_q8 * (scale_hxq * sumi_idx + offset_hxq * sumi_q8);
         }
     }
@@ -133,33 +168,32 @@ void ggml_vec_dot_hxq_affine_6_q8_0(int n, float * GGML_RESTRICT s, size_t bs, c
         const float offset_hxq = GGML_FP16_TO_FP32(x[i].offset);
 
         // 4 Q8_0 blocks per HXQ block (128 / 32 = 4)
+        // Each Q8_0 block = 32 elements = 8 groups of 4 packed 6-bit values (24 bytes)
         for (int k = 0; k < 4; k++) {
             const float d_q8 = GGML_FP16_TO_FP32(y[i * 4 + k].d);
+            const int8_t * GGML_RESTRICT q8 = y[i * 4 + k].qs;
+            const uint8_t * GGML_RESTRICT qs = x[i].qs + k * 24;
 
             int32_t sumi_idx = 0;
             int32_t sumi_q8  = 0;
 
-            // Unpack 6-bit indices for this Q8_0 block's 32 elements
-            for (int j = 0; j < QK8_0; j++) {
-                const int elem = k * QK8_0 + j;
-                const int group = elem / 4;
-                const int pos   = elem % 4;
-                const int byte_idx = group * 3;
-                const uint8_t b0 = x[i].qs[byte_idx + 0];
-                const uint8_t b1 = x[i].qs[byte_idx + 1];
-                const uint8_t b2 = x[i].qs[byte_idx + 2];
+            for (int g = 0; g < 8; g++) {
+                const uint8_t b0 = qs[g * 3 + 0];
+                const uint8_t b1 = qs[g * 3 + 1];
+                const uint8_t b2 = qs[g * 3 + 2];
 
-                uint8_t idx;
-                switch (pos) {
-                    case 0: idx =  b0       & 0x3F; break;
-                    case 1: idx = ((b0 >> 6) | (b1 << 2)) & 0x3F; break;
-                    case 2: idx = ((b1 >> 4) | (b2 << 4)) & 0x3F; break;
-                    default: idx = b2 >> 2; break;
-                }
+                const int32_t i0 =  b0       & 0x3F;
+                const int32_t i1 = ((b0 >> 6) | (b1 << 2)) & 0x3F;
+                const int32_t i2 = ((b1 >> 4) | (b2 << 4)) & 0x3F;
+                const int32_t i3 =  b2 >> 2;
 
-                const int q8_val = y[i * 4 + k].qs[j];
-                sumi_idx += (int32_t)idx * q8_val;
-                sumi_q8  += q8_val;
+                const int32_t q0 = q8[g * 4 + 0];
+                const int32_t q1 = q8[g * 4 + 1];
+                const int32_t q2 = q8[g * 4 + 2];
+                const int32_t q3 = q8[g * 4 + 3];
+
+                sumi_idx += i0*q0 + i1*q1 + i2*q2 + i3*q3;
+                sumi_q8  += q0 + q1 + q2 + q3;
             }
 
             sumf += d_q8 * (scale_hxq * sumi_idx + offset_hxq * sumi_q8);
