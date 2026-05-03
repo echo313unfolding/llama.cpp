@@ -748,7 +748,7 @@ static __device__ __forceinline__ float vec_dot_hxq_affine_g128_q8_1(
     const float d8 = __low2float(bq8->ds);
     const float s8 = __high2float(bq8->ds);  // sum of q8 values in this block
 
-    return d8 * (scale * sumi + offset * s8);
+    return d8 * scale * (float)sumi + offset * s8;
 }
 
 // HXQ affine 6-bit: 6-bit indices packed 4 per 3 bytes, scale+offset per group of 128
@@ -789,7 +789,7 @@ static __device__ __forceinline__ float vec_dot_hxq_affine_6_q8_1(
     const float d8 = __low2float(bq8->ds);
     const float s8 = __high2float(bq8->ds);
 
-    return d8 * (scale * sumi_idx + offset * s8);
+    return d8 * scale * (float)sumi_idx + offset * s8;
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
