@@ -769,22 +769,67 @@ static __device__ __forceinline__ float vec_dot_hxq_affine_6_q8_1(
 
     const block_q8_1 * bq8 = bq8_1 + iqs;
 
-    const uint8_t * qs = bq->qs + iqs * 24;
+    // qs chunk is 24 bytes, always 4-byte aligned (struct offset 4 + iqs*24)
+    const uint32_t * qw = (const uint32_t *)(bq->qs + iqs * 24);
 
+    // Pre-load 24 bytes as 6 aligned uint32 words (6 loads vs 24 byte loads)
+    const uint32_t w0 = qw[0];
+    const uint32_t w1 = qw[1];
+    const uint32_t w2 = qw[2];
+    const uint32_t w3 = qw[3];
+    const uint32_t w4 = qw[4];
+    const uint32_t w5 = qw[5];
+
+    // Extract 8 packed 3-byte groups from 6 words, then unpack 6-bit indices
     int sumi = 0;
 
-#pragma unroll
-    for (int g = 0; g < 8; ++g) {
-        // Load 3 bytes containing 4 packed 6-bit indices
-        const uint32_t packed = qs[g*3+0] | ((uint32_t)qs[g*3+1] << 8) | ((uint32_t)qs[g*3+2] << 16);
-        // Unpack 4 six-bit indices into 4 bytes of an int32 for dp4a
-        // idx0 = bits[0:5], idx1 = bits[6:11], idx2 = bits[12:17], idx3 = bits[18:23]
-        const int unpacked = (packed        & 0x3F)
-                           | ((packed <<  2) & 0x3F00)
-                           | ((packed <<  4) & 0x3F0000)
-                           | ((packed <<  6) & 0x3F000000);
-        const int u = get_int_b4(bq8->qs, g);
-        sumi = ggml_cuda_dp4a(unpacked, u, sumi);
+    // g=0: bytes 0-2
+    {
+        const uint32_t p = w0 & 0x00FFFFFF;
+        const int u = get_int_b4(bq8->qs, 0);
+        sumi = ggml_cuda_dp4a((int)((p & 0x3F) | ((p << 2) & 0x3F00) | ((p << 4) & 0x3F0000) | ((p << 6) & 0x3F000000)), u, sumi);
+    }
+    // g=1: bytes 3-5
+    {
+        const uint32_t p = ((w0 >> 24) | (w1 << 8)) & 0x00FFFFFF;
+        const int u = get_int_b4(bq8->qs, 1);
+        sumi = ggml_cuda_dp4a((int)((p & 0x3F) | ((p << 2) & 0x3F00) | ((p << 4) & 0x3F0000) | ((p << 6) & 0x3F000000)), u, sumi);
+    }
+    // g=2: bytes 6-8
+    {
+        const uint32_t p = ((w1 >> 16) | (w2 << 16)) & 0x00FFFFFF;
+        const int u = get_int_b4(bq8->qs, 2);
+        sumi = ggml_cuda_dp4a((int)((p & 0x3F) | ((p << 2) & 0x3F00) | ((p << 4) & 0x3F0000) | ((p << 6) & 0x3F000000)), u, sumi);
+    }
+    // g=3: bytes 9-11
+    {
+        const uint32_t p = (w2 >> 8) & 0x00FFFFFF;
+        const int u = get_int_b4(bq8->qs, 3);
+        sumi = ggml_cuda_dp4a((int)((p & 0x3F) | ((p << 2) & 0x3F00) | ((p << 4) & 0x3F0000) | ((p << 6) & 0x3F000000)), u, sumi);
+    }
+    // g=4: bytes 12-14
+    {
+        const uint32_t p = w3 & 0x00FFFFFF;
+        const int u = get_int_b4(bq8->qs, 4);
+        sumi = ggml_cuda_dp4a((int)((p & 0x3F) | ((p << 2) & 0x3F00) | ((p << 4) & 0x3F0000) | ((p << 6) & 0x3F000000)), u, sumi);
+    }
+    // g=5: bytes 15-17
+    {
+        const uint32_t p = ((w3 >> 24) | (w4 << 8)) & 0x00FFFFFF;
+        const int u = get_int_b4(bq8->qs, 5);
+        sumi = ggml_cuda_dp4a((int)((p & 0x3F) | ((p << 2) & 0x3F00) | ((p << 4) & 0x3F0000) | ((p << 6) & 0x3F000000)), u, sumi);
+    }
+    // g=6: bytes 18-20
+    {
+        const uint32_t p = ((w4 >> 16) | (w5 << 16)) & 0x00FFFFFF;
+        const int u = get_int_b4(bq8->qs, 6);
+        sumi = ggml_cuda_dp4a((int)((p & 0x3F) | ((p << 2) & 0x3F00) | ((p << 4) & 0x3F0000) | ((p << 6) & 0x3F000000)), u, sumi);
+    }
+    // g=7: bytes 21-23
+    {
+        const uint32_t p = (w5 >> 8) & 0x00FFFFFF;
+        const int u = get_int_b4(bq8->qs, 7);
+        sumi = ggml_cuda_dp4a((int)((p & 0x3F) | ((p << 2) & 0x3F00) | ((p << 4) & 0x3F0000) | ((p << 6) & 0x3F000000)), u, sumi);
     }
 
     const float d8 = __low2float(bq8->ds);
