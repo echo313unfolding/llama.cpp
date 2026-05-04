@@ -723,6 +723,8 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
 // HXQ affine g128: 8-bit indices, scale+offset per group of 128
 // dot(HXQ, Q8_1) = scale * sum(idx[i]*q8[i]) + offset * sum(q8[i])
 // iqs selects which of the 4 chunks of 32 elements to process (0-3)
+// dp4a treats bytes as signed int8. XOR 0x80 maps [0,255] -> [-128,127].
+// Correction: sum(idx*q8) = sum((idx^0x80)*q8) + 128*sum(q8)
 static __device__ __forceinline__ float vec_dot_hxq_affine_g128_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -733,27 +735,30 @@ static __device__ __forceinline__ float vec_dot_hxq_affine_g128_q8_1(
 
     const block_q8_1 * bq8 = bq8_1 + iqs;
 
-    // Load 32 uint8 indices for this chunk and pack into 8 ints (4 bytes each)
     const uint8_t * qs = bq->qs + iqs * 32;
 
     int sumi = 0;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-        // Pack 4 unsigned indices into one int
-        const int vi = qs[j*4+0] | (qs[j*4+1] << 8) | (qs[j*4+2] << 16) | (qs[j*4+3] << 24);
-        const int u  = get_int_b4(bq8->qs, j);
+        int vi = qs[j*4+0] | (qs[j*4+1] << 8) | (qs[j*4+2] << 16) | (qs[j*4+3] << 24);
+        vi ^= 0x80808080; // unsigned [0,255] -> signed [-128,127] for dp4a
+        const int u = get_int_b4(bq8->qs, j);
         sumi = ggml_cuda_dp4a(vi, u, sumi);
     }
 
     const float d8 = __low2float(bq8->ds);
-    const float s8 = __high2float(bq8->ds);  // sum of q8 values in this block
+    const float s8 = __high2float(bq8->ds);
 
-    return d8 * scale * (float)sumi + offset * s8;
+    // sumi = sum((idx-128)*q8). Correct: d8*scale*(sumi+128*sum(q8)) + offset*d8*sum(q8)
+    // = d8*scale*sumi + (128*scale+offset)*s8  [since s8 = d8*sum(q8)]
+    return d8 * scale * (float)sumi + (128.0f * scale + offset) * s8;
 }
 
 // HXQ affine 6-bit: 6-bit indices packed 4 per 3 bytes, scale+offset per group of 128
 // dot(HXQ6, Q8_1) = scale * sum(idx6[i]*q8[i]) + offset * sum(q8[i])
 // iqs selects which of the 4 chunks of 32 elements to process (0-3)
+// dp4a optimization: unpack 3 bytes -> 4 indices in int32, then dp4a with q8.
+// 6-bit indices (0-63) fit in signed int8, no correction needed.
 static __device__ __forceinline__ float vec_dot_hxq_affine_6_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -764,32 +769,28 @@ static __device__ __forceinline__ float vec_dot_hxq_affine_6_q8_1(
 
     const block_q8_1 * bq8 = bq8_1 + iqs;
 
-    // Each chunk of 32 elements = 8 groups of 4 packed 6-bit values = 24 bytes
     const uint8_t * qs = bq->qs + iqs * 24;
-    const int8_t  * q8 = bq8->qs;
 
-    int sumi_idx = 0;
+    int sumi = 0;
 
-    // Unpack 6-bit indices and dot with q8 values
-    // 8 groups of 4 elements, each group is 3 bytes
 #pragma unroll
     for (int g = 0; g < 8; ++g) {
-        const uint8_t b0 = qs[g * 3 + 0];
-        const uint8_t b1 = qs[g * 3 + 1];
-        const uint8_t b2 = qs[g * 3 + 2];
-
-        const int i0 =  b0       & 0x3F;
-        const int i1 = ((b0 >> 6) | (b1 << 2)) & 0x3F;
-        const int i2 = ((b1 >> 4) | (b2 << 4)) & 0x3F;
-        const int i3 =  b2 >> 2;
-
-        sumi_idx += i0 * q8[g*4+0] + i1 * q8[g*4+1] + i2 * q8[g*4+2] + i3 * q8[g*4+3];
+        // Load 3 bytes containing 4 packed 6-bit indices
+        const uint32_t packed = qs[g*3+0] | ((uint32_t)qs[g*3+1] << 8) | ((uint32_t)qs[g*3+2] << 16);
+        // Unpack 4 six-bit indices into 4 bytes of an int32 for dp4a
+        // idx0 = bits[0:5], idx1 = bits[6:11], idx2 = bits[12:17], idx3 = bits[18:23]
+        const int unpacked = (packed        & 0x3F)
+                           | ((packed <<  2) & 0x3F00)
+                           | ((packed <<  4) & 0x3F0000)
+                           | ((packed <<  6) & 0x3F000000);
+        const int u = get_int_b4(bq8->qs, g);
+        sumi = ggml_cuda_dp4a(unpacked, u, sumi);
     }
 
     const float d8 = __low2float(bq8->ds);
     const float s8 = __high2float(bq8->ds);
 
-    return d8 * scale * (float)sumi_idx + offset * s8;
+    return d8 * scale * (float)sumi + offset * s8;
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
